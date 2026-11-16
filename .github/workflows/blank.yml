@@ -1,36 +1,725 @@
-# This is a basic workflow to help you get started with Actions
+name: LNRKernel
 
-name: CI
+# Source: NoGravityKernel (NGK) sm8250 untuk POCO F3 (alioth), dibuild lewat
+# compile-alioth.sh bawaan NGK (GPU dtsi, firmware touch, dtb, dtbo AOSP + MIUI).
+# Hasil: dua zip terpisah, tanpa pilihan tombol saat flash:
+#   LNRKernel-<tanggal>-nonksu.zip  -> tanpa KernelSU (Magisk tetap utuh kalau ada)
+#   LNRKernel-<tanggal>-ksun.zip    -> KernelSU Next
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      repo:
+        description: Repo source kernel (owner/nama)
+        default: Pierre2324/NGK_android_kernel_xiaomi_sm8250
+      branch:
+        description: Branch source kernel
+        default: t-caf
+      ksu_ref:
+        description: Ref KernelSU Next untuk zip KSUN (branch, tag, atau commit)
+        default: legacy
+      kcflags:
+        description: Flag compiler tambahan (kosongkan kalau build error)
+        default: "-O3"
+      gpu_oc:
+        description: GPU OC dalam MHz, pisahkan koma (kosongkan = mati, pakai bawaan NGK)
+        default: "725,700"
+      gpu_vlvl:
+        description: Vote level voltase GX untuk level OC (320 = NOM_L1, sama seperti stock 670)
+        default: "320"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+env:
+  # Identitas di /proc/version:
+  #   Linux version 4.19.x-LNRKernel (LNR@LNRKernel) (LNR clang version X, LLD X) ...
+  KBUILD_BUILD_USER: LNR
+  KBUILD_BUILD_HOST: LNRKernel
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  # ganti string ini kalau toolchain diganti, supaya cache lama tidak terpakai
+  CCACHE_COMPILERCHECK: "string:proton-clang"
+  CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
+
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    name: Build ${{ matrix.variant }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [stock, ksu]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      W: ${{ github.workspace }}/work
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Install dependencies
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev zip ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Cache toolchain
+        id: clang_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/lnr-clang
+          key: lnr-proton-clang-v1
+
+      - name: Fetch toolchain
+        if: steps.clang_cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang ~/lnr-clang
+          rm -rf ~/lnr-clang/.git
+
+      - name: Toolchain PATH
+        run: echo "$HOME/lnr-clang/bin" >> "$GITHUB_PATH"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ matrix.variant }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.variant }}-
+
+      - name: Source kernel
+        env:
+          REPO: ${{ inputs.repo }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$W"
+          git clone --depth=1 -b "${BRANCH:-t-caf}" \
+            "https://github.com/${REPO:-Pierre2324/NGK_android_kernel_xiaomi_sm8250}" "$W/kernel"
+          cd "$W/kernel"
+          test -f compile-alioth.sh || { echo "::error::compile-alioth.sh tidak ada di branch ini"; exit 1; }
+          test -f arch/arm64/configs/nogravity-alioth_defconfig || { echo "::error::nogravity-alioth_defconfig tidak ada"; exit 1; }
+
+          # Tambahan config LNR ditempel di akhir defconfig (baris terakhir menang)
+          printf '\n' >> arch/arm64/configs/nogravity-alioth_defconfig
+          cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
+          # --- LNRKernel ---
+          CONFIG_LOCALVERSION="-LNRKernel"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          CONFIG_LTO_CLANG=y
+          CONFIG_THINLTO=y
+          CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+          # CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
+          # CONFIG_DEBUG_INFO is not set
+          EOF
+
+      - name: Bersihkan KSU bawaan NGK
+        run: |
+          set -euo pipefail
+          cd "$W/kernel"
+          # Source NGK sudah membawa hook KSU tanpa guard, baris Kconfig/Makefile, dan
+          # symlink drivers/kernelsu ke path lokal pemilik repo (putus di runner).
+          # Dibuang dulu supaya stock bersih dan hook varian ksu dipasang sekali saja.
+          rm -f drivers/kernelsu
+          sed -i '\|^source "drivers/kernelsu/Kconfig"$|d' drivers/Kconfig
+          sed -i '\|^obj-y += kernelsu/$|d' drivers/Makefile
+          python3 - <<'PY'
+          import re, pathlib
+          for p in ["fs/exec.c", "fs/stat.c", "fs/read_write.c", "fs/open.c", "drivers/input/input.c"]:
+              f = pathlib.Path(p)
+              s = f.read_text(encoding="utf-8", errors="surrogateescape")
+              n = re.sub(r"^extern int ksu_handle_\w+\([^;]*\);\n", "", s, flags=re.M)
+              n = re.sub(r"^[ \t]*ksu_handle_\w+\(.*\);\n", "", n, flags=re.M)
+              if n != s:
+                  f.write_text(n, encoding="utf-8", errors="surrogateescape")
+                  print("[LNR] hook KSU bawaan dibuang:", p)
+          PY
+          if grep -rn 'ksu_handle_' fs/exec.c fs/stat.c fs/read_write.c fs/open.c drivers/input/input.c; then
+            echo "::error::masih ada hook KSU bawaan"; exit 1
+          fi
+          if grep -rn 'drivers/kernelsu' drivers/Kconfig || grep -n 'kernelsu' drivers/Makefile; then
+            echo "::error::referensi kernelsu bawaan masih ada"; exit 1
+          fi
+
+      - name: GPU OC (NGK alioth)
+        if: inputs.gpu_oc != ''
+        env:
+          GPU_OC: ${{ inputs.gpu_oc }}
+          GPU_VLVL: ${{ inputs.gpu_vlvl }}
+        run: |
+          set -euo pipefail
+          cat > "$W/lnr-gpu-oc.py" <<'PY'
+          #!/usr/bin/env python3
+          """LNR GPU OC untuk NGK (alioth / Adreno 650).
+
+          Pakai:  python3 lnr-gpu-oc.py <kernel_dir> <freq_mhz,freq_mhz,...> [vlvl]
+          Contoh: python3 lnr-gpu-oc.py work/kernel 725,700 320
+
+          Yang dilakukan:
+            1. Tambah OPP + power level baru di atas 682 MHz pada tiap speed-bin yang
+               level teratasnya 682 MHz (bin 0/1/2/4; bin 3 sengaja dilewati).
+            2. Geser nomor level lama, plus initial-pwrlevel dan throttle-pwrlevel,
+               supaya tetap menunjuk frekuensi yang sama seperti sebelumnya.
+            3. Naikkan KGSL_MAX_PWRLEVELS kalau jumlah level jadi lebih dari 10.
+
+          Jalankan SEBELUM compile-alioth.sh (script itu menyalin
+          kona-v2-gpu-alioth.dtsi ke kona-v2-gpu.dtsi).
+          """
+          import re
+          import sys
+          import pathlib
+
+          BASE_HZ = 682_000_000
+          DTSI = "arch/arm64/boot/dts/vendor/qcom/kona-v2-gpu-xxxx/kona-v2-gpu-alioth.dtsi"
+          PWRH = "drivers/gpu/msm/kgsl_pwrctrl.h"
+
+
+          def die(msg):
+              sys.exit("[LNR-GPU-OC] " + msg)
+
+
+          def match_brace(s, open_idx):
+              depth = 0
+              for i in range(open_idx, len(s)):
+                  if s[i] == "{":
+                      depth += 1
+                  elif s[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return i
+              die("kurung { tidak seimbang")
+
+
+          def line_start(s, i):
+              return s.rfind("\n", 0, i) + 1
+
+
+          def line_end(s, i):
+              j = s.find("\n", i)
+              return len(s) if j < 0 else j + 1
+
+
+          def patch_bin(block, freqs_hz, vlvl):
+              """block = teks satu node qcom,gpu-pwrlevels-N { ... }"""
+              n = len(freqs_hz)
+              m0 = re.search(r"qcom,gpu-pwrlevel@0\s*\{", block)
+              if not m0:
+                  die("pwrlevel@0 tidak ketemu")
+              ob = m0.end() - 1
+              cb = match_brace(block, ob)
+              top = re.search(r"qcom,gpu-freq\s*=\s*<(\d+)>", block[ob:cb])
+              if not top or int(top.group(1)) != BASE_HZ:
+                  return block, False
+
+              s0, e0 = line_start(block, m0.start()), line_end(block, cb)
+              template = block[s0:e0]
+
+              # geser nomor level lama
+              block = re.sub(r"(qcom,gpu-pwrlevel@)(\d+)", lambda m: m.group(1) + str(int(m.group(2)) + n), block)
+              block = re.sub(r"(reg\s*=\s*<)(\d+)(>)", lambda m: m.group(1) + str(int(m.group(2)) + n) + m.group(3), block)
+              for key in ("qcom,initial-pwrlevel", "qcom,throttle-pwrlevel"):
+                  block = re.sub(r"(%s\s*=\s*<)(\d+)(>)" % re.escape(key),
+                                 lambda m: m.group(1) + str(int(m.group(2)) + n) + m.group(3), block)
+
+              # sisipkan level baru sebelum level lama (yang sekarang @n)
+              new = ""
+              for i, hz in enumerate(freqs_hz):
+                  t = template
+                  t = re.sub(r"qcom,gpu-pwrlevel@\d+", "qcom,gpu-pwrlevel@%d" % i, t, count=1)
+                  t = re.sub(r"(reg\s*=\s*<)\d+(>)", r"\g<1>%d\g<2>" % i, t, count=1)
+                  t = re.sub(r"(qcom,gpu-freq\s*=\s*<)\d+(>)", r"\g<1>%d\g<2>" % hz, t, count=1)
+                  new += t + ("" if t.endswith("\n\n") else "\n")
+              return block[:s0] + new + block[s0:], True
+
+
+          def main():
+              if len(sys.argv) < 3:
+                  die(__doc__)
+              root = pathlib.Path(sys.argv[1])
+              mhz = sorted({int(x) for x in sys.argv[2].replace(" ", "").split(",") if x}, reverse=True)
+              vlvl = int(sys.argv[3]) if len(sys.argv) > 3 else 320
+              if not mhz:
+                  print("[LNR-GPU-OC] daftar frekuensi kosong, dilewati")
+                  return
+              freqs = [f * 1_000_000 for f in mhz]
+              if min(freqs) <= BASE_HZ or max(mhz) > 900:
+                  die("frekuensi harus di antara 683 dan 900 MHz")
+
+              f = root / DTSI
+              if not f.is_file():
+                  die("tidak ada: %s" % f)
+              s = f.read_text()
+              if any("opp-%d " % hz in s for hz in freqs):
+                  die("level OC sudah pernah ditambahkan")
+
+              # 1) OPP table
+              m = re.search(r"gpu_opp_table_v2:\s*gpu-opp-table_v2\s*\{", s)
+              if not m:
+                  die("gpu_opp_table_v2 tidak ketemu")
+              opp = "".join(
+                  "\n\t\topp-%d {\n\t\t\topp-hz = /bits/ 64 <%d>;\n\t\t\topp-microvolt = <%d>;\n\t\t};\n" % (hz, hz, vlvl)
+                  for hz in freqs
+              )
+              # properti (compatible) harus tetap di atas sub-node, jadi sisipkan setelahnya
+              mc = re.compile(r"compatible\s*=\s*\"operating-points-v2\"\s*;[^\n]*\n").search(s, m.end())
+              if not mc:
+                  die("compatible operating-points-v2 tidak ketemu")
+              s = s[: mc.end()] + opp + s[mc.end():]
+
+              # 2) power level per speed-bin
+              patched, skipped, pos = [], [], 0
+              while True:
+                  m = re.compile(r"qcom,gpu-pwrlevels-(\d+)\s*\{").search(s, pos)
+                  if not m:
+                      break
+                  ob = m.end() - 1
+                  cb = match_brace(s, ob)
+                  block = s[m.start(): cb + 1]
+                  new, ok = patch_bin(block, freqs, vlvl)
+                  sb = re.search(r"qcom,speed-bin\s*=\s*<(\d+)>", block)
+                  (patched if ok else skipped).append(sb.group(1) if sb else m.group(1))
+                  s = s[: m.start()] + new + s[cb + 1:]
+                  pos = m.start() + len(new)
+              if not patched:
+                  die("tidak ada speed-bin dengan level teratas 682 MHz")
+              f.write_text(s)
+              print("[LNR-GPU-OC] OC %s MHz @vlvl %d | speed-bin dipatch: %s | dilewati: %s"
+                    % (",".join(map(str, mhz)), vlvl, ",".join(patched), ",".join(skipped) or "-"))
+
+              # 3) batas jumlah level KGSL
+              h = root / PWRH
+              hs = h.read_text()
+              need = 9 + len(freqs)  # 8 level aktif + level 0 Hz + level baru
+              mm = re.search(r"(#define\s+KGSL_MAX_PWRLEVELS\s+)(\d+)", hs)
+              if not mm:
+                  die("KGSL_MAX_PWRLEVELS tidak ketemu")
+              if int(mm.group(2)) < need:
+                  h.write_text(hs[: mm.start(2)] + str(need) + hs[mm.end(2):])
+                  print("[LNR-GPU-OC] KGSL_MAX_PWRLEVELS %s -> %d" % (mm.group(2), need))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python3 "$W/lnr-gpu-oc.py" "$W/kernel" "$GPU_OC" "${GPU_VLVL:-320}"
+
+      - name: Integrasi KernelSU Next (manual hook)
+        if: matrix.variant == 'ksu'
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: |
+          set -euo pipefail
+          git clone -b legacy https://github.com/KernelSU-Next/KernelSU-Next "$W/KernelSU-Next"
+          git -C "$W/KernelSU-Next" checkout "${KSU_REF:-legacy}"
+          git -C "$W/KernelSU-Next" log -1 --format='KernelSU Next: %h %s'
+
+          cd "$W/kernel"
+          ln -sfn ../../KernelSU-Next/kernel drivers/kernelsu
+          grep -q kernelsu drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q kernelsu drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          cat >> arch/arm64/configs/nogravity-alioth_defconfig <<'EOF'
+          # --- LNRKernel: KernelSU Next ---
+          CONFIG_LOCALVERSION="-LNRKernel-KSUN"
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          # CONFIG_KSU_SYSCALL_TABLE_HOOK is not set
+          CONFIG_OVERLAY_FS=y
+          EOF
+
+          # Pasang hook manual KernelSU Next ke source kernel (4.19 non-GKI).
+          # Sengaja gagal keras kalau bentuk source tidak cocok, supaya tidak
+          # menghasilkan kernel "KSU" yang diam-diam tidak berfungsi.
+          KSU_DIR="$W/KernelSU-Next/kernel" python3 - <<'PY'
+          import os, re, sys, pathlib
+
+          T = "\t"
+          KSU = pathlib.Path(os.environ["KSU_DIR"])
+          blob = "\n".join(p.read_text(errors="ignore") for p in KSU.rglob("*") if p.suffix in (".c", ".h"))
+
+          need = ["ksu_handle_execveat", "ksu_handle_faccessat", "ksu_handle_stat",
+                  "ksu_handle_sys_read", "ksu_handle_sys_reboot"]
+          miss = [n for n in need if n not in blob]
+          if miss:
+              sys.exit("[LNR] ref KernelSU Next ini tidak punya hook manual: " + ", ".join(miss))
+          has_read = "ksu_vfs_read_hook" in blob
+          has_input_fn = "ksu_handle_input_handle_event" in blob
+          has_input = "ksu_input_hook" in blob
+
+
+          def blk(*lines):
+              return "#ifdef CONFIG_KSU /* LNR-KSU */\n" + "".join(l + "\n" for l in lines) + "#endif\n"
+
+
+          def body_span(s, sig):
+              m = re.search(sig, s, re.M)
+              if not m:
+                  return None
+              o = re.compile(r"^\{", re.M).search(s, m.end())
+              if not o:
+                  return None
+              i, depth, n = o.start(), 0, len(s)
+              while i < n:
+                  c = s[i]
+                  if s.startswith("/*", i):
+                      i = s.index("*/", i + 2) + 2
+                      continue
+                  if s.startswith("//", i):
+                      i = s.index("\n", i)
+                      continue
+                  if c in "\"'":
+                      i += 1
+                      while s[i] != c:
+                          i += 2 if s[i] == "\\" else 1
+                      i += 1
+                      continue
+                  if c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return m.start(), o.start(), i
+                  i += 1
+              return None
+
+
+          def put(s, sig, anchors, text, decl="", optional=False):
+              sp = body_span(s, sig)
+              if not sp:
+                  if optional:
+                      print("[LNR] lewati (tidak ketemu):", sig)
+                      return s
+                  sys.exit("[LNR] fungsi tidak ketemu: " + sig)
+              start, ob, cb = sp
+              body = s[ob:cb]
+              for a in anchors:
+                  m = re.search(a, body, re.M)
+                  if m:
+                      at = ob + body.rfind("\n", 0, m.start()) + 1
+                      s = s[:at] + text + s[at:]
+                      return s[:start] + decl + s[start:]
+              if optional:
+                  print("[LNR] lewati (anchor tidak ketemu):", sig)
+                  return s
+              sys.exit("[LNR] anchor tidak ketemu di %s: %s" % (sig, anchors))
+
+
+          def exec_c(s):
+              wrapper = re.search(r"^static int __do_execve_file\(", s, re.M)
+              anchor = r"^\treturn __do_execve_file\(" if wrapper else r"^\tif \(IS_ERR\(filename\)\)"
+              return put(s, r"^static int do_execveat_common\(", [anchor], blk(
+                  T + "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);",
+                  T + "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"))
+
+
+          def open_c(s):
+              return put(s, r"^(?:long do_faccessat\(|SYSCALL_DEFINE3\(faccessat,)", [r"^\tif \(mode & ~S_IRWXO\)"], blk(
+                  T + "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);",
+                  T + "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"))
+
+
+          def stat_c(s):
+              return put(s, r"^(?:static\s+)?(?:inline\s+)?int vfs_statx\(", [r"^\tif \(\(flags & ~\("], blk(
+                  T + "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);",
+                  T + "ksu_handle_stat(&dfd, &filename, &flags);"))
+
+
+          def read_c(s):
+              fn = "extern void ksu_handle_sys_read(unsigned int fd);"
+              if has_read:
+                  decl = blk("extern bool ksu_vfs_read_hook __read_mostly;", fn)
+                  hook = blk(T + "if (unlikely(ksu_vfs_read_hook))", T + T + "ksu_handle_sys_read(fd);")
+              else:
+                  decl = blk(fn)
+                  hook = blk(T + "ksu_handle_sys_read(fd);")
+              return put(s, r"^SYSCALL_DEFINE3\(read,", [r"^\tif \(f\.file\) \{", r"^\treturn ksys_read\("], hook, decl)
+
+
+          def reboot_c(s):
+              return put(s, r"^SYSCALL_DEFINE4\(reboot,",
+                         [r"^\tif \(check_poweroff_charger_mode\(\)\)", r"^\t/\* We only trust the superuser with rebooting the system\. \*/"], blk(
+                  T + "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);",
+                  T + "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"))
+
+
+          def input_c(s):
+              if not has_input_fn:
+                  return s
+              fn = "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);"
+              if has_input:
+                  decl = blk("extern bool ksu_input_hook __read_mostly;", fn)
+                  hook = blk(T + "if (unlikely(ksu_input_hook))", T + T + "ksu_handle_input_handle_event(&type, &code, &value);")
+              else:
+                  decl = blk(fn)
+                  hook = blk(T + "ksu_handle_input_handle_event(&type, &code, &value);")
+              return put(s, r"^static void input_handle_event\(", [r"^\tif \(disposition != INPUT_IGNORE_EVENT"],
+                         hook, decl, optional=True)
+
+
+          for path, fn in [("fs/exec.c", exec_c), ("fs/open.c", open_c), ("fs/stat.c", stat_c),
+                           ("fs/read_write.c", read_c),
+                           ("kernel/reboot.c", reboot_c), ("drivers/input/input.c", input_c)]:
+              p = pathlib.Path(path)
+              s = p.read_text(encoding="utf-8", errors="surrogateescape")
+              if "LNR-KSU" in s:
+                  print("[LNR] sudah dipatch:", path)
+                  continue
+              n = fn(s)
+              if n != s:
+                  p.write_text(n, encoding="utf-8", errors="surrogateescape")
+                  print("[LNR] hook terpasang:", path)
+          PY
+
+      - name: Build (${{ matrix.variant }})
+        env:
+          KCFLAGS: ${{ inputs.kcflags }}
+        run: |
+          set -euo pipefail
+          cd "$W/kernel"
+          clang --version | head -n1
+
+          # ---- banner: versi clang tetap tampil, bertanda LNR ----
+          CLANG_V=$(clang --version | sed -n '1s/.*clang version \([0-9][0-9.]*\).*/\1/p')
+          LLD_V=$(ld.lld --version | sed -n '1s/.*LLD \([0-9][0-9.]*\).*/\1/p')
+          export LNR_CC="LNR clang version ${CLANG_V:-unknown}, LLD ${LLD_V:-unknown}"
+          cat > "$W/banner.py" <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path("scripts/mkcompile_h")
+          s = p.read_text()
+          new, n = re.subn(r"^([ \t]*).*#define LINUX_COMPILER.*$",
+                           lambda m: m.group(1) + "echo \\#define LINUX_COMPILER \\\"" + os.environ["LNR_CC"] + "\\\"",
+                           s, flags=re.M)
+          if n:
+              p.write_text(new)
+              print("[LNR] LINUX_COMPILER ->", os.environ["LNR_CC"])
+          else:
+              print("::warning::LINUX_COMPILER tidak ketemu di scripts/mkcompile_h, string clang tetap bawaan")
+          PY
+          if grep -q KBUILD_COMPILER_STRING scripts/mkcompile_h; then
+            echo "[LNR] mkcompile_h mendukung KBUILD_COMPILER_STRING -> $LNR_CC"
+          else
+            python3 "$W/banner.py"
+          fi
+
+          # ---- compile-alioth.sh bawaan NGK, dengan path toolchain dan identitas LNR ----
+          if [ -x "$HOME/lnr-clang/bin/aarch64-linux-gnu-ld" ]; then
+            P64="$HOME/lnr-clang/bin/aarch64-linux-gnu-"; P32="$HOME/lnr-clang/bin/arm-linux-gnueabi-"
+          else
+            P64=aarch64-linux-gnu-; P32=arm-linux-gnueabi-
+          fi
+          S=lnr-build.sh
+          cp compile-alioth.sh "$S"
+          sed -i \
+            -e "s|^COMPILERDIR=.*|COMPILERDIR=\"$HOME/lnr-clang\"|" \
+            -e 's|^COMPILER=.*|COMPILER="ccache clang"|' \
+            -e 's|CC=\${COMPILER}|CC="${COMPILER}"|g' \
+            -e "s|\${COMPILERDIR}/bin/aarch64-linux-gnu-|$P64|g" \
+            -e "s|\${COMPILERDIR}/bin/arm-linux-gnueabi-|$P32|g" \
+            -e '/^export KBUILD_BUILD_USER=/d' \
+            -e '/^export KBUILD_BUILD_HOST=/d' \
+            -e 's|KBUILD_COMPILER_STRING="[^"]*"|KBUILD_COMPILER_STRING="${LNR_CC}"|' \
+            "$S"
+          chk() { grep -qE "$1" "$S" || { echo "::error::patch compile-alioth.sh gagal ($1), format script berubah?"; exit 1; }; }
+          chk '^COMPILER="ccache clang"'
+          chk "^COMPILERDIR=\"$HOME/lnr-clang\""
+          chk 'KBUILD_COMPILER_STRING="\$\{LNR_CC\}"'
+          if grep -qE '^export KBUILD_BUILD_(USER|HOST)=' "$S"; then echo "::error::export KBUILD_BUILD_* masih ada"; exit 1; fi
+          sh -n "$S"
+
+          # ---- cek config ----
+          MK=(make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang"
+              CROSS_COMPILE="$P64" CROSS_COMPILE_COMPAT="$P32" LD=ld.lld AR=llvm-ar NM=llvm-nm
+              OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip ld-name=lld)
+          echo "::group::Defconfig"
+          "${MK[@]}" nogravity-alioth_defconfig
+          cfg() { grep -q "^$1\$" out/.config || { echo "::error::$1 tidak masuk .config (symbol Kconfig berubah?)"; exit 1; }; }
+          if [ "$VARIANT" = ksu ]; then cfg CONFIG_KSU=y; cfg CONFIG_KSU_MANUAL_HOOK=y; fi
+          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG|THINLTO|CFI_CLANG|SHADOW_CALL_STACK|KSU)' out/.config || true
+          echo "::endgroup::"
+
+          if [ "$VARIANT" = ksu ]; then
+            # Kbuild KernelSU Next menyuntik backport (path_umount dan sejenisnya) ke fs/ saat Makefile
+            # drivers/kernelsu dibaca. Dibaca duluan di sini supaya injeksi pasti selesai
+            # sebelum fs/ dikompilasi.
+            echo "::group::KSU: pre-trigger Kbuild"
+            "${MK[@]}" drivers/kernelsu/
+            echo "::endgroup::"
+          fi
+
+          # ---- build (script NGK tidak mengembalikan exit code error, jadi hasilnya dicek manual) ----
+          echo "::group::Compile"
+          ccache -z
+          set +e
+          sh "./$S" 2>&1 | tee "$W/build.log"
+          set -e
+          echo "::endgroup::"
+
+          O=out/outputs/alioth
+          for f in Image.gz dtb dtbo.img; do
+            if [ ! -s "$O/$f" ]; then
+              echo "::error::$f tidak terbentuk, build gagal"
+              tail -n 80 "$W/build.log"
+              exit 1
+            fi
+          done
+          if [ ! -s "$O/alioth_dtbo-miui.img" ]; then echo "::warning::dtbo MIUI tidak terbentuk"; fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$O/Image.gz" "$GITHUB_WORKSPACE/dist/"
+          if [ "$VARIANT" = stock ]; then
+            cp "$O/dtb" "$O/dtbo.img" "$GITHUB_WORKSPACE/dist/"
+            if [ -s "$O/alioth_dtbo-miui.img" ]; then cp "$O/alioth_dtbo-miui.img" "$GITHUB_WORKSPACE/dist/"; fi
+          fi
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+          H=out/include/generated
+          grep -E 'LINUX_COMPILE_BY|LINUX_COMPILE_HOST|LINUX_COMPILER|UTS_RELEASE' "$H/compile.h" "$H/utsrelease.h" || true
+          if grep -qiE 'lineage|pierre|nogravity|proton' "$H/compile.h" "$H/utsrelease.h"; then
+            echo "::warning::masih ada nama lain di banner kernel"
+          fi
+          ccache -s
+
+      - name: Upload hasil build
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.variant }}
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  package:
+    name: Package zip
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download hasil build
+        uses: actions/download-artifact@v4
+        with:
+          pattern: out-*
+          path: images
+
+      - name: Buat zip AnyKernel3
+        run: |
+          set -euo pipefail
+          if [ ! -s images/out-stock/Image.gz ]; then echo "::error::build non-KSU gagal, tidak ada zip"; exit 1; fi
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AK3
+          rm -rf AK3/.git
+
+          cat > anykernel.tpl <<'EOF'
+          ### AnyKernel3 - @KSTR@ (alioth)
+
+          properties() { '
+          kernel.string=@KSTR@
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=alioth
+          device.name2=aliothin
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          LNR_VARIANT=@VARIANT@;
+          LNR_HOME=${AKHOME:-${home:-$PWD}};
+          LNR_PROPS=${LNR_PROPS:-"/system/build.prop /system/system/build.prop /system_ext/etc/build.prop /system/system_ext/etc/build.prop /product/etc/build.prop /system/product/etc/build.prop /vendor/build.prop /mi_ext/etc/build.prop"};
+
+          # lnr_magisk -> return 0 kalau boot ramdisk (atau /data) menunjukkan Magisk
+          lnr_magisk() {
+            _sp=${SPLITIMG:-${split_img:-$LNR_HOME/split_img}};
+            _bn=${BIN:-${bin:-$LNR_HOME/tools}};
+            if [ -s $_sp/ramdisk.cpio ] && [ -x $_bn/magiskboot ]; then
+              cp -f $_sp/ramdisk.cpio $LNR_HOME/.lnr_rd;
+              $_bn/magiskboot decompress $LNR_HOME/.lnr_rd $LNR_HOME/.lnr_rd.raw >/dev/null 2>&1 && mv -f $LNR_HOME/.lnr_rd.raw $LNR_HOME/.lnr_rd;
+              $_bn/magiskboot cpio $LNR_HOME/.lnr_rd test >/dev/null 2>&1;
+              _rc=$?;
+              rm -f $LNR_HOME/.lnr_rd $LNR_HOME/.lnr_rd.raw;
+              [ $((_rc & 1)) -eq 1 ] && return 0;
+            fi;
+            [ -d /data/adb/magisk ] || [ -f /data/adb/magisk.db ] && return 0;
+            return 1;
+          }
+
+          # lnr_rom -> LNR_ROM=miui | aosp | none (none = build.prop tidak terbaca)
+          lnr_rom() {
+            LNR_ROM=none;
+            for _f in $LNR_PROPS; do
+              [ -f $_f ] || continue;
+              [ "$LNR_ROM" = none ] && LNR_ROM=aosp;
+              if grep -qE '^ro\.(miui\.ui\.version\.(name|code)|mi\.os\.version\.name)=' $_f; then LNR_ROM=miui; return 0; fi;
+            done;
+            return 0;
+          }
+
+          # ramdisk tidak dibongkar/diubah -> Magisk (kalau ada) tetap utuh
+          split_boot;
+
+          if lnr_magisk; then
+            ui_print "Magisk terdeteksi";
+            if [ "$LNR_VARIANT" = ksu ]; then
+              ui_print "! KSU dan Magisk bisa bentrok.";
+              ui_print "! Sebaiknya uninstall Magisk dulu.";
+            else
+              ui_print "Root Magisk dipertahankan.";
+            fi;
+          fi;
+
+          flash_boot;
+
+          # dtbo sesuai ROM (AOSP / MIUI). Kalau ROM tidak terdeteksi, dtbo dibiarkan.
+          lnr_rom;
+          case $LNR_ROM in
+            miui) LNR_DT=$LNR_HOME/dtbo/miui.img;;
+            aosp) LNR_DT=$LNR_HOME/dtbo/aosp.img;;
+            *)    LNR_DT=;;
+          esac;
+          if [ "$LNR_DT" ] && [ -s "$LNR_DT" ]; then
+            ui_print "ROM $LNR_ROM -> flash dtbo $LNR_ROM";
+            cp -f $LNR_DT $LNR_HOME/dtbo.img;
+            if type flash_generic >/dev/null 2>&1; then
+              flash_generic dtbo;
+            elif type flash_dtbo >/dev/null 2>&1; then
+              flash_dtbo;
+            fi;
+          else
+            ui_print "dtbo tidak diubah";
+          fi;
+          ## end boot install
+          EOF
+
+          DATE=$(date +%Y%m%d)
+          mkdir -p extra
+          cp images/out-stock/dtbo.img extra/dtbo-aosp.img
+          if [ -s images/out-stock/alioth_dtbo-miui.img ]; then cp images/out-stock/alioth_dtbo-miui.img extra/dtbo-miui.img; fi
+
+          mkzip() { # $1=varian (stock|ksu)  $2=akhiran nama zip  $3=nama kernel
+            z=$(mktemp -d)
+            cp -r AK3/. "$z/"
+            cp "images/out-$1/Image.gz" "$z/Image.gz"
+            cp images/out-stock/dtb "$z/dtb"
+            mkdir "$z/dtbo"
+            cp extra/dtbo-aosp.img "$z/dtbo/aosp.img"
+            if [ -s extra/dtbo-miui.img ]; then cp extra/dtbo-miui.img "$z/dtbo/miui.img"; fi
+            sed -e "s/@VARIANT@/$1/" -e "s/@KSTR@/$3/g" anykernel.tpl > "$z/anykernel.sh"
+            (cd "$z" && zip -r9 "$GITHUB_WORKSPACE/LNRKernel-$DATE-$2.zip" . -x '.git*' 'README.md' '*placeholder')
+          }
+          mkzip stock nonksu "LNRKernel (non-KSU)"
+          if [ -s images/out-ksu/Image.gz ]; then
+            mkzip ksu ksun "LNRKernel (KernelSU Next)"
+          else
+            echo "::warning::build KSUN gagal, zip KSUN tidak dibuat"
+          fi
+          ls -lh LNRKernel-*.zip
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: LNRKernel
+          path: |
+            LNRKernel-*.zip
+            extra/dtbo-*.img
